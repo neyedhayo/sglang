@@ -534,6 +534,8 @@ def eval_result(model_answer_path, answer_dict):
         answer_dict_w_cat[category].update({data_id: parsed_pred})
 
     evaluation_result = {}
+    # Dict to store detailed results with actual predictions
+    detailed_results = {}
 
     for category in CAT_SHORT2LONG.values():
         # print("Evaluating: {}".format(category))
@@ -546,28 +548,43 @@ def eval_result(model_answer_path, answer_dict):
             continue
 
         exampels_to_eval = []
+        category_detailed_results = {}
+        
         for data_id, parsed_pred in cat_outputs.items():
             question_type = cat_answers[data_id]["question_type"]
+            gold_answer = cat_answers[data_id]["ground_truth"]
+            
+            # Store the original prediction before parsing
+            original_pred = parsed_pred
+            
             if question_type != "multiple-choice":
-                parsed_pred = parse_open_response(
-                    parsed_pred
-                )  # mainly for type consistency (make it number, etc.)
+                parsed_pred = parse_open_response(parsed_pred)
+                is_correct = eval_open(gold_answer, parsed_pred)
             else:
-                parsed_pred = parsed_pred
+                is_correct = eval_multi_choice(gold_answer, parsed_pred)
 
-            exampels_to_eval.append(
-                {
-                    "id": data_id,
-                    "question_type": question_type,
-                    "answer": cat_answers[data_id]["ground_truth"],
-                    "parsed_pred": parsed_pred,
-                }
-            )
+            # Store detailed results for this question
+            category_detailed_results[data_id] = {
+                "question_type": question_type,
+                "ground_truth": gold_answer,
+                "prediction": original_pred,
+                "parsed_prediction": parsed_pred if question_type != "multiple-choice" else None,
+                "is_correct": is_correct
+            }
+            
+            exampels_to_eval.append({
+                "id": data_id,
+                "question_type": question_type,
+                "answer": gold_answer,
+                "parsed_pred": parsed_pred,
+            })
 
         judge_dict, metric_dict = evaluate(exampels_to_eval)
         metric_dict.update({"num_example": len(exampels_to_eval)})
 
         evaluation_result[category] = metric_dict
+        # Store detailed results per category
+        detailed_results[category] = category_detailed_results
 
     printable_results = {}
     # pdb.set_trace()
@@ -607,9 +624,17 @@ def eval_result(model_answer_path, answer_dict):
         "acc": overall_acc,
     }
     pprint.pprint(printable_results)
+    
+    # Save the summary results
     out = model_answer_path
     with open(out, "w", encoding="utf-8") as outfile:
         json.dump(printable_results, outfile)
         print(f"eval out saved to {out}")
+    
+    # Save the detailed results to a separate file
+    detailed_out = out.replace('.json', '_detailed.json')
+    with open(detailed_out, "w", encoding="utf-8") as outfile:
+        json.dump(detailed_results, outfile)
+        print(f"detailed results saved to {detailed_out}")
 
     print(f"Overall accuracy: {overall_acc}")
