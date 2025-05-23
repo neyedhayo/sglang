@@ -30,7 +30,9 @@ def eval_mmmu(args):
         model = AutoModelForImageTextToText.from_pretrained(
             args.model_path,
             torch_dtype="auto",
-            trust_remote_code=True,
+            device_map="auto",  # distribute layers automatically
+            torch_dtype=torch.float16,  # use 16-bit precision :contentReference[oaicite:0]{index=0}
+            trust_remote_code=True, # allow Bunny’s custom config code :contentReference[oaicite:1]{index=1}
         )
     except Exception as first_exception:
         try:
@@ -43,6 +45,8 @@ def eval_mmmu(args):
                 model = AutoModel.from_pretrained(
                     args.model_path,
                     torch_dtype="auto",
+                    device_map="auto",
+                    torch_dtype=torch.float16,
                     trust_remote_code=True,
                 )
                 generation_config_internvl = dict(
@@ -52,8 +56,9 @@ def eval_mmmu(args):
             else:
                 model = AutoModel.from_pretrained(
                     args.model_path,
-                    torch_dtype="auto",
-                    trust_remote_code=True,
+                    device_map="auto",          # distribute layers automatically
+                    torch_dtype=torch.float16,  # half‐precision on GPU
+                    trust_remote_code=True,     # load Bunny’s custom config
                     init_tts=False,
                 )
         except Exception as second_exception:
