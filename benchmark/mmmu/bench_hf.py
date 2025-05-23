@@ -1,6 +1,5 @@
 import argparse
-
-import PIL
+from PIL import Image
 import torch
 from data_utils import save_json
 from eval_utils import (
@@ -11,78 +10,98 @@ from eval_utils import (
     process_result,
 )
 from tqdm import tqdm
-from transformers import AutoModel, AutoProcessor, GenerationConfig
+from transformers import GenerationConfig
 
 
 @torch.no_grad()
 def eval_mmmu(args):
     eval_args = EvalArgs.from_cli_args(args)
-
     sampling_params = get_sampling_params(eval_args)
     generation_config = GenerationConfig(
         max_new_tokens=sampling_params["max_new_tokens"],
         do_sample=False,
     )
 
+    # ─── Model Loading ────────────────────────────────────────────────────────────
     try:
-        from transformers import AutoModelForImageTextToText
+        # 1️⃣ Try the ImageText2Text interface
+        from transformers import AutoModelForImageTextToText, AutoProcessor
 
         model = AutoModelForImageTextToText.from_pretrained(
             args.model_path,
-            device_map="auto",  # distribute layers automatically
-            torch_dtype=torch.float16,  # use 16-bit precision :contentReference[oaicite:0]{index=0}
-            trust_remote_code=True, # allow Bunny’s custom config code :contentReference[oaicite:1]{index=1}
+            device_map="auto",
+            torch_dtype=torch.float16,
+            trust_remote_code=True,
         )
-    except Exception as first_exception:
-        try:
-            # check if the model is belongs to internvl
-            if "InternVL" in args.model_path:
-                from internvl_utils import load_image
-                from transformers import AutoTokenizer
+        processor = AutoProcessor.from_pretrained(
+            args.model_path,
+            trust_remote_code=True,
+        )
+        is_internvl = False
+        is_causal = False
 
-                tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+    except Exception as first_exception:
+        # 2️⃣ On failure, check for InternVL or fallback to CausalLM
+        try:
+            if "InternVL" in args.model_path:
+                # InternVL loading logic
+                from internvl_utils import load_image
+                from transformers import AutoModel, AutoTokenizer
+
+                tokenizer = AutoTokenizer.from_pretrained(
+                    args.model_path,
+                    trust_remote_code=True,
+                )
                 model = AutoModel.from_pretrained(
                     args.model_path,
                     device_map="auto",
                     torch_dtype=torch.float16,
                     trust_remote_code=True,
                 )
-                generation_config_internvl = dict(
-                    max_new_tokens=sampling_params["max_new_tokens"], do_sample=False
-                )
+                generation_config_internvl = {
+                    "max_new_tokens": sampling_params["max_new_tokens"],
+                    "do_sample": False,
+                }
+                is_internvl = True
+                is_causal = False
 
             else:
-                model = AutoModel.from_pretrained(
+                # Fallback to Bunny-4B’s CausalLM interface
+                from transformers import AutoModelForCausalLM, AutoTokenizer
+
+                tokenizer = AutoTokenizer.from_pretrained(
                     args.model_path,
-                    device_map="auto",          # distribute layers automatically
-                    torch_dtype=torch.float16,  # half‐precision on GPU
-                    trust_remote_code=True,     # load Bunny’s custom config
-                    init_tts=False,
+                    trust_remote_code=True,
                 )
+                model = AutoModelForCausalLM.from_pretrained(
+                    args.model_path,
+                    device_map="auto",
+                    torch_dtype=torch.float16,
+                    trust_remote_code=True,
+                )
+                is_internvl = False
+                is_causal = True
+
         except Exception as second_exception:
             raise RuntimeError(
-                f"Failed to load model: First attempt failed with {first_exception}, "
-                f"second attempt failed with {second_exception}"
+                f"Failed to load model: First attempt failed with {first_exception!r}, "
+                f"second attempt failed with {second_exception!r}"
             ) from second_exception
 
     model = model.eval().cuda()
-
-    processor = AutoProcessor.from_pretrained(
-        args.model_path, torch_dtype="auto", device_map="auto", trust_remote_code=True
-    )
+    # ──────────────────────────────────────────────────────────────────────────────
 
     samples = prepare_samples(eval_args)
-    out_samples = dict()
-
+    out_samples = {}
     answer_dict = {}
+
     for sample in tqdm(samples):
         prompt = sample["final_input_prompt"]
-        image = sample["image"]
-        prefix = prompt.split("<")[0]
-        suffix = prompt.split(">")[1]
-        assert image is not None
+        prefix, suffix = prompt.split("<")[0], prompt.split(">")[1]
+        assert sample["image"] is not None
 
-        if "InternVL" in args.model_path:
+        # ─── InternVL branch ───────────────────────────────────────────────────────
+        if is_internvl:
             pixel_values = load_image(sample["image_path"]).to(torch.bfloat16).cuda()
             contents = ""
             if prefix:
@@ -90,26 +109,56 @@ def eval_mmmu(args):
             contents += "<image>\n"
             if suffix:
                 contents += suffix
+
             response = model.chat(
-                tokenizer, pixel_values, contents, generation_config_internvl
+                tokenizer,
+                pixel_values,
+                contents,
+                generation_config_internvl,
             )
-            print(f"response: {response}")
             process_result(response, sample, answer_dict, out_samples)
             continue
 
+        # ─── CausalLM branch ───────────────────────────────────────────────────────
+        if is_causal:
+            # split around the image tag
+            text_before, text_after = prompt.split("<image>")
+            # tokenize text before image
+            input_ids = tokenizer(
+                text_before, return_tensors="pt"
+            ).input_ids.to(model.device)
+            # process image
+            image_tensor = model.process_images(
+                [Image.open(sample["image_path"])],
+                model.config
+            ).to(dtype=model.dtype, device=model.device)
+            # generate
+            output_ids = model.generate(
+                input_ids=input_ids,
+                images=image_tensor,
+                max_new_tokens=sampling_params["max_new_tokens"],
+                do_sample=False,
+            )
+            # decode only the newly generated portion
+            response = tokenizer.decode(
+                output_ids[0][input_ids.shape[-1]:],
+                skip_special_tokens=True,
+            )
+            process_result(response, sample, answer_dict, out_samples)
+            continue
+
+        # ─── ImageText2Text branch ─────────────────────────────────────────────────
+        # build the chat-style contents list
         contents = []
         if prefix:
-            contents += [{"type": "text", "text": prefix}]
-        contents += [
-            {
-                "type": "image",
-                "image": sample["image_path"],
-            }
-        ]
+            contents.append({"type": "text", "text": prefix})
+        contents.append({"type": "image", "image": sample["image_path"]})
         if suffix:
-            contents += [{"type": "text", "text": suffix}]
+            contents.append({"type": "text", "text": suffix})
         messages = [{"role": "user", "content": contents}]
+
         try:
+            # template → tokens → generate
             model_inputs = processor.tokenizer.apply_chat_template(
                 messages,
                 tokenize=True,
@@ -117,23 +166,26 @@ def eval_mmmu(args):
                 add_generation_prompt=True,
                 return_tensors="pt",
             ).to(model.device)
+
             input_len = model_inputs["input_ids"].shape[-1]
-            generation = model.generate(
-                **model_inputs, generation_config=generation_config
+            gen = model.generate(
+                **model_inputs,
+                generation_config=generation_config,
             )
-            generation = generation[0][input_len:]
-            response = processor.decode(generation, skip_special_tokens=True)
-        except:
-            contents = []
+            gen = gen[0][input_len:]
+            response = processor.decode(gen, skip_special_tokens=True)
+
+        except Exception:
+            # fallback to .chat() if templating fails
+            fallback_msgs = [{"role": "user", "content": []}]
             if prefix:
-                contents += [prefix]
-            image = PIL.Image.open(sample["image_path"])
-            contents += [image]
+                fallback_msgs[0]["content"].append(prefix)
+            fallback_msgs[0]["content"].append(Image.open(sample["image_path"]))
             if suffix:
-                contents += [suffix]
-            messages = [{"role": "user", "content": contents}]
+                fallback_msgs[0]["content"].append(suffix)
+
             response = model.chat(
-                msgs=messages,
+                msgs=fallback_msgs,
                 tokenizer=processor.tokenizer,
                 sampling=False,
                 max_new_tokens=sampling_params["max_new_tokens"],
@@ -141,7 +193,7 @@ def eval_mmmu(args):
                 generate_audio=False,
                 temperature=0.0,
             )
-        print(f"response: {response}")
+
         process_result(response, sample, answer_dict, out_samples)
 
     args.output_path = f"{args.model_path}_val_hf.json"
@@ -154,10 +206,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model-path",
         type=str,
-        help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
         required=True,
+        help="Path or HF repo ID of the model weights.",
     )
     EvalArgs.add_cli_args(parser)
     args = parser.parse_args()
-
     eval_mmmu(args)
