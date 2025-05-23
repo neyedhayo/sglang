@@ -29,7 +29,6 @@ def eval_mmmu(args):
 
         model = AutoModelForImageTextToText.from_pretrained(
             args.model_path,
-            torch_dtype="auto",
             device_map="auto",  # distribute layers automatically
             torch_dtype=torch.float16,  # use 16-bit precision :contentReference[oaicite:0]{index=0}
             trust_remote_code=True, # allow Bunny’s custom config code :contentReference[oaicite:1]{index=1}
@@ -44,7 +43,6 @@ def eval_mmmu(args):
                 tokenizer = AutoTokenizer.from_pretrained(args.model_path)
                 model = AutoModel.from_pretrained(
                     args.model_path,
-                    torch_dtype="auto",
                     device_map="auto",
                     torch_dtype=torch.float16,
                     trust_remote_code=True,
