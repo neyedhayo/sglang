@@ -91,6 +91,11 @@ def eval_mmmu(args):
     model = model.eval().cuda()
     # ──────────────────────────────────────────────────────────────────────────────
 
+    from transformers_modules.BAAI.Bunny_v1_1_4B.modeling_bunny_phi3 import DynamicCache
+    if not hasattr(DynamicCache, "get_max_length") and hasattr(DynamicCache, "get_seq_length"):
+        DynamicCache.get_max_length = DynamicCache.get_seq_length
+        print("DynamicCache.get_max_length = DynamicCache.get_seq_length")
+        
     samples = prepare_samples(eval_args)
     out_samples = {}
     answer_dict = {}
