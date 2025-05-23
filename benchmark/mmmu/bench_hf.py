@@ -121,29 +121,46 @@ def eval_mmmu(args):
 
         # ─── CausalLM branch ───────────────────────────────────────────────────────
         if is_causal:
-            # split around the image tag
-            text_before, text_after = prompt.split("<image>")
-            # tokenize text before image
+            # safe split around the image tag
+            before, sep, after = prompt.partition("<image>")
+            if sep:
+                text_before = before
+                text_after  = after
+            else:
+                text_before = prompt
+                text_after  = ""
+
+            # tokenize text_before
             input_ids = tokenizer(
                 text_before, return_tensors="pt"
             ).input_ids.to(model.device)
-            # process image
-            image_tensor = model.process_images(
-                [Image.open(sample["image_path"])],
-                model.config
-            ).to(dtype=model.dtype, device=model.device)
-            # generate
-            output_ids = model.generate(
-                input_ids=input_ids,
-                images=image_tensor,
-                max_new_tokens=sampling_params["max_new_tokens"],
-                do_sample=False,
-            )
-            # decode only the newly generated portion
+
+            # process image only if we actually found one
+            if sep:
+                image_tensor = model.process_images(
+                    [Image.open(sample["image_path"])],
+                    model.config
+                ).to(dtype=model.dtype, device=model.device)
+            else:
+                image_tensor = None
+
+            # generate: pass images= only when present
+            gen_kwargs = {
+                "input_ids": input_ids,
+                "max_new_tokens": sampling_params["max_new_tokens"],
+                "do_sample": False,
+            }
+            if image_tensor is not None:
+                gen_kwargs["images"] = image_tensor
+
+            output_ids = model.generate(**gen_kwargs)
+
+            # decode newly generated tokens
+            start = input_ids.shape[-1]
             response = tokenizer.decode(
-                output_ids[0][input_ids.shape[-1]:],
-                skip_special_tokens=True,
+                output_ids[0][start:], skip_special_tokens=True
             )
+
             process_result(response, sample, answer_dict, out_samples)
             continue
 
